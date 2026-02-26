@@ -1,5 +1,22 @@
-aiohttp==3.13.3
+# Core framework
 fastapi==0.129.0
+uvicorn==0.41.0
+python-dotenv==1.2.1
+pydantic==2.12.5
+
+# Database
+sqlalchemy==2.0.36
+aiosqlite==0.20.0          # SQLite async driver
+# asyncpg==0.30.0           # Uncomment for Postgres
+
+# Auth
+python-jose[cryptography]==3.3.0
+bcrypt==4.2.1
+
+# Rate limiting
+slowapi==0.1.9
+
+# LangChain / LLM
 langchain==1.2.8
 langchain-community==0.4.1
 langchain-google-genai==4.2.1
@@ -7,6 +24,6 @@ langchain-tavily==0.2.17
 langgraph==1.0.7
 langgraph-checkpoint==4.0.0
 langsmith==0.6.7
-pydantic==2.12.5
-python-dotenv==1.2.1
-uvicorn==0.41.0
+
+# HTTP
+aiohttp==3.13.3
