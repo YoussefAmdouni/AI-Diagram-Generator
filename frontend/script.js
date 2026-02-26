@@ -1,103 +1,188 @@
-const chatBox = document.getElementById('chat-box');
-const userInput = document.getElementById('user-input');
-const sendButton = document.getElementById('send-button');
-const newChatButton = document.getElementById('new-chat-button');
+// ─── DOM refs ────────────────────────────────────────────────────────────────
+const chatBox           = document.getElementById('chat-box');
+const userInput         = document.getElementById('user-input');
+const sendButton        = document.getElementById('send-button');
+const newChatButton     = document.getElementById('new-chat-button');
 const conversationsList = document.getElementById('conversations-list');
-const sidebarToggle = document.getElementById('sidebar-toggle');
-const sidebar = document.getElementById('sidebar');
-const loadingIndicator = document.getElementById('loading-indicator');
-const agentSteps = document.getElementById('agent-steps');
-
-let currentConversationId = null;
-let currentSessionId = null;
+const sidebarToggle     = document.getElementById('sidebar-toggle');
+const sidebar           = document.getElementById('sidebar');
+const loadingIndicator  = document.getElementById('loading-indicator');
+const agentSteps        = document.getElementById('agent-steps');
+const authModal         = document.getElementById('auth-modal');
+const authForm          = document.getElementById('auth-form');
+const authToggle        = document.getElementById('auth-toggle');
+const authTitle         = document.getElementById('auth-title');
+const authSubmit        = document.getElementById('auth-submit');
+const userEmailDisplay  = document.getElementById('user-email');
+const logoutBtn         = document.getElementById('logout-btn');
 
 const API_BASE = 'http://localhost:8000/api';
 
-let mermaidDiagramCount = 0;  // Counter for unique diagram IDs
+let currentConversationId = null;
+let mermaidDiagramCount   = 0;
+let isLoginMode           = true;
+let appInitialized        = false;   // guard against double-init
 
-// Loading indicator helper functions
+// ─── Auth helpers ─────────────────────────────────────────────────────────────
+const getToken   = () => localStorage.getItem('access_token');
+const setToken   = t  => localStorage.setItem('access_token', t);
+const clearToken = () => localStorage.removeItem('access_token');
+
+function authHeaders() {
+    return {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${getToken()}`,
+    };
+}
+
+async function apiFetch(path, options = {}) {
+    const res = await fetch(`${API_BASE}${path}`, {
+        ...options,
+        headers: { ...authHeaders(), ...(options.headers || {}) },
+    });
+    if (res.status === 401) {
+        clearToken();
+        showAuthModal();
+        throw new Error('Session expired. Please log in again.');
+    }
+    return res;
+}
+
+// ─── Auth modal ───────────────────────────────────────────────────────────────
+function showAuthModal() {
+    appInitialized = false;
+    authModal.classList.remove('hidden');
+    document.getElementById('main-ui').classList.add('hidden');
+}
+
+function hideAuthModal() {
+    authModal.classList.add('hidden');
+    document.getElementById('main-ui').classList.remove('hidden');
+}
+
+authToggle.addEventListener('click', () => {
+    isLoginMode = !isLoginMode;
+    authTitle.textContent  = isLoginMode ? 'Sign In' : 'Create Account';
+    authSubmit.textContent = isLoginMode ? 'Sign In' : 'Register';
+    authToggle.textContent = isLoginMode
+        ? "Don't have an account? Register"
+        : 'Already have an account? Sign in';
+    document.getElementById('auth-error').textContent = '';
+});
+
+authForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const email    = document.getElementById('auth-email').value.trim();
+    const password = document.getElementById('auth-password').value;
+    const errorEl  = document.getElementById('auth-error');
+
+    errorEl.textContent    = '';
+    authSubmit.disabled    = true;
+    authSubmit.textContent = 'Please wait...';
+
+    try {
+        let res;
+        if (isLoginMode) {
+            const body = new URLSearchParams({ username: email, password });
+            res = await fetch(`${API_BASE}/auth/login`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body,
+            });
+        } else {
+            res = await fetch(`${API_BASE}/auth/register`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ email, password }),
+            });
+        }
+
+        let data;
+        try { data = await res.json(); }
+        catch { throw new Error(`Server error (HTTP ${res.status})`); }
+
+        if (!res.ok) {
+            const detail = Array.isArray(data.detail)
+                ? data.detail.map(d => d.msg).join(', ')
+                : (data.detail || `HTTP ${res.status}`);
+            throw new Error(detail);
+        }
+
+        setToken(data.access_token);
+        userEmailDisplay.textContent = data.user.email;
+        hideAuthModal();
+        await init();
+
+    } catch (err) {
+        errorEl.textContent = err.message;
+    } finally {
+        // Always re-enable the button
+        authSubmit.disabled    = false;
+        authSubmit.textContent = isLoginMode ? 'Sign In' : 'Register';
+    }
+});
+
+logoutBtn.addEventListener('click', () => {
+    clearToken();
+    currentConversationId   = null;
+    appInitialized          = false;
+    chatBox.innerHTML       = '';
+    conversationsList.innerHTML = '';
+    showAuthModal();
+});
+
+// ─── Loading helpers ──────────────────────────────────────────────────────────
 function showLoading() {
-    if (loadingIndicator) {
-        loadingIndicator.classList.remove('hidden');
-        agentSteps.innerHTML = '';
-        chatBox.scrollTop = chatBox.scrollHeight;
-    }
+    loadingIndicator.classList.remove('hidden');
+    agentSteps.innerHTML = '';
+    chatBox.scrollTop = chatBox.scrollHeight;
 }
-
 function hideLoading() {
-    if (loadingIndicator) {
-        loadingIndicator.classList.add('hidden');
-        agentSteps.innerHTML = '';
-    }
+    loadingIndicator.classList.add('hidden');
+    agentSteps.innerHTML = '';
 }
-
-function addStep(stepText, isCompleted = false) {
-    if (!agentSteps) return;
-    
-    const stepEl = document.createElement('div');
-    stepEl.classList.add('agent-step');
-    if (isCompleted) {
-        stepEl.classList.add('completed');
-    } else {
-        stepEl.classList.add('current');
-    }
-    
-    const icon = document.createElement('span');
-    icon.classList.add('step-icon');
-    if (isCompleted) {
-        icon.innerHTML = '<i class="fa-solid fa-check"></i>';
-    } else {
-        icon.innerHTML = '<i class="fa-solid fa-circle-notch spinner-small"></i>';
-    }
-    
-    const text = document.createElement('span');
-    text.textContent = stepText;
-    
-    stepEl.appendChild(icon);
-    stepEl.appendChild(text);
-    agentSteps.appendChild(stepEl);
-    
-    // Auto-scroll loading indicator into view
+function addStep(text) {
+    const el = document.createElement('div');
+    el.classList.add('agent-step', 'current');
+    el.innerHTML = `<span class="step-icon"><i class="fa-solid fa-circle-notch spinner-small"></i></span><span>${text}</span>`;
+    agentSteps.appendChild(el);
     loadingIndicator.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
 
-// Initialize app
+// ─── Init (runs once after login / token validation) ──────────────────────────
 async function init() {
-    await loadConversations();
+    if (appInitialized) return;
+    appInitialized = true;
 
-    // Check if there are any conversations, if not create one
     const conversations = await fetchConversations();
     if (conversations.length === 0) {
         await createNewConversation();
     } else {
-        // Load the most recent conversation
-        await switchConversation(conversations[0].id);
+        // Render sidebar first, then load the most recent conversation
+        renderSidebar(conversations);
+        await loadConversationMessages(conversations[0].id);
+        currentConversationId = conversations[0].id;
+        renderSidebar(conversations);   // re-render to mark active
     }
 }
 
-// Fetch all conversations
+// ─── Conversations ────────────────────────────────────────────────────────────
 async function fetchConversations() {
     try {
-        const response = await fetch(`${API_BASE}/conversations`);
-        const data = await response.json();
+        const res  = await apiFetch('/conversations');
+        const data = await res.json();
         return data.conversations || [];
-    } catch (error) {
-        console.error('Error fetching conversations:', error);
+    } catch {
         return [];
     }
 }
 
-// Load conversations into sidebar
-async function loadConversations() {
-    const conversations = await fetchConversations();
+function renderSidebar(convs) {
     conversationsList.innerHTML = '';
-
-    conversations.forEach(conv => {
-        const convItem = document.createElement('div');
-        convItem.classList.add('conversation-item');
-        if (conv.id === currentConversationId) {
-            convItem.classList.add('active');
-        }
+    convs.forEach(conv => {
+        const item = document.createElement('div');
+        item.classList.add('conversation-item');
+        if (conv.id === currentConversationId) item.classList.add('active');
 
         const title = document.createElement('div');
         title.classList.add('conversation-title');
@@ -105,340 +190,228 @@ async function loadConversations() {
 
         const meta = document.createElement('div');
         meta.classList.add('conversation-meta');
-        const date = new Date(conv.updated_at);
-        meta.textContent = `${conv.message_count || 0} messages • ${formatDate(date)}`;
+        meta.textContent = `${conv.message_count} msgs • ${formatDate(new Date(conv.updated_at))}`;
 
-        const deleteBtn = document.createElement('button');
-        deleteBtn.classList.add('conversation-delete');
-        deleteBtn.innerHTML = '<i class="fa-solid fa-trash"></i>';
-        deleteBtn.onclick = async (e) => {
-            e.stopPropagation();
-            await deleteConversation(conv.id);
-        };
+        const del = document.createElement('button');
+        del.classList.add('conversation-delete');
+        del.innerHTML = '<i class="fa-solid fa-trash"></i>';
+        del.onclick = async (e) => { e.stopPropagation(); await deleteConversation(conv.id); };
 
-        convItem.appendChild(title);
-        convItem.appendChild(meta);
-        convItem.appendChild(deleteBtn);
-
-        const sessionId = conv.session_id || conv.sessionId;
-        convItem.onclick = () => switchConversation(conv.id, sessionId);
-
-        conversationsList.appendChild(convItem);
+        item.append(title, meta, del);
+        item.onclick = () => switchConversation(conv.id);
+        conversationsList.appendChild(item);
     });
 }
 
-// Create a new conversation
+async function loadConversations() {
+    const convs = await fetchConversations();
+    renderSidebar(convs);
+}
+
 async function createNewConversation() {
     try {
-        const response = await fetch(`${API_BASE}/conversations`, {
+        const res  = await apiFetch('/conversations', {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-                title: 'New Conversation'
-            })
+            body: JSON.stringify({ title: 'New Conversation' }),
         });
+        const conv = await res.json();
 
-        const newConv = await response.json();
-        currentConversationId = newConv.id;
-        currentSessionId = newConv.session_id;
-        
-        // Clear chat and reset mermaid state
-        chatBox.innerHTML = '';
-        mermaidDiagramCount = 0;  // Reset diagram counter
-        
-        // Reset Mermaid's internal state
-        if (window.mermaid) {
-            try {
-                mermaid.initialize({ 
-                    startOnLoad: false,
-                    theme: 'default',
-                    securityLevel: 'loose'
-                });
-            } catch (e) {
-                console.warn('Could not reset mermaid:', e);
-            }
-        }
+        currentConversationId = conv.id;
+        chatBox.innerHTML     = '';
+        mermaidDiagramCount   = 0;
+        resetMermaid();
 
-        await loadConversations();
-    } catch (error) {
-        console.error('Error creating conversation:', error);
+        await loadConversations();   // reload sidebar (new conv will be highlighted)
+    } catch (err) {
+        console.error('Failed to create conversation:', err);
     }
 }
 
-// Switch to a different conversation
-async function switchConversation(conversationId, sessionId) {
-    currentConversationId = conversationId;
-    currentSessionId = sessionId;
-    
-    // Clear chat and reset mermaid state
-    chatBox.innerHTML = '';
-    mermaidDiagramCount = 0;  // Reset diagram counter
-    
-    // Reset Mermaid's internal state to prevent diagram conflicts
-    if (window.mermaid) {
-        try {
-            // Reset mermaid's state
-            mermaid.initialize({ 
-                startOnLoad: false,
-                theme: 'default',
-                securityLevel: 'loose'
-            });
-            // Clear any cached diagrams
-            if (mermaid.contentLoaded) {
-                mermaid.contentLoaded = [];
-            }
-        } catch (e) {
-            console.warn('Could not reset mermaid:', e);
-        }
-    }
-
-    // Load messages for this conversation
+async function loadConversationMessages(id) {
     try {
-        const params = new URLSearchParams();
-        if (sessionId) params.append('session_id', sessionId);
-        const response = await fetch(`${API_BASE}/conversations/${conversationId}/messages?${params}`);
-        const data = await response.json();
-
-        data.messages.forEach(msg => {
-            appendMessage(msg.content, msg.type, false);
-        });
-    } catch (error) {
-        console.error('Error loading messages:', error);
+        const res  = await apiFetch(`/conversations/${id}/messages`);
+        const data = await res.json();
+        chatBox.innerHTML   = '';
+        mermaidDiagramCount = 0;
+        resetMermaid();
+        data.messages.forEach(m =>
+            appendMessage(m.content, m.role === 'user' ? 'user' : 'bot', false)
+        );
+        // Scroll to bottom after loading history
+        chatBox.scrollTop = chatBox.scrollHeight;
+    } catch (err) {
+        console.error('Failed to load messages:', err);
     }
-
-    await loadConversations();
 }
 
-// Delete a conversation
-async function deleteConversation(conversationId) {
-    if (!confirm('Are you sure you want to delete this conversation?')) {
-        return;
-    }
+async function switchConversation(id) {
+    if (id === currentConversationId) return;   // already active, do nothing
+    currentConversationId = id;
+    await loadConversationMessages(id);
+    await loadConversations();   // re-render sidebar to update active highlight
+}
 
+async function deleteConversation(id) {
+    if (!confirm('Delete this conversation?')) return;
     try {
-        const response = await fetch(`${API_BASE}/conversations/${conversationId}`, {
-            method: 'DELETE'
-        });
-
-        if (!response.ok) {
-            const errorData = await response.json();
-            alert(`Cannot delete conversation: ${errorData.detail || 'Unknown error'}`);
-            return;
-        }
-
-        // If we deleted the current conversation, create a new one
-        if (conversationId === currentConversationId) {
+        await apiFetch(`/conversations/${id}`, { method: 'DELETE' });
+        if (id === currentConversationId) {
+            currentConversationId = null;
             await createNewConversation();
         } else {
             await loadConversations();
         }
-    } catch (error) {
-        console.error('Error deleting conversation:', error);
-        alert('Error deleting conversation. Please try again.');
+    } catch (err) {
+        console.error('Failed to delete conversation:', err);
     }
 }
 
-// Format date for display
-function formatDate(date) {
-    const now = new Date();
-    const diff = now - date;
-    const days = Math.floor(diff / (1000 * 60 * 60 * 24));
-
-    if (days === 0) {
-        return 'Today';
-    } else if (days === 1) {
-        return 'Yesterday';
-    } else if (days < 7) {
-        return `${days} days ago`;
-    } else {
-        return date.toLocaleDateString();
+function resetMermaid() {
+    if (window.mermaid) {
+        try {
+            mermaid.initialize({ startOnLoad: false, theme: 'default', securityLevel: 'loose' });
+        } catch (e) { console.warn(e); }
     }
 }
 
-// Send message
+// ─── Send message ─────────────────────────────────────────────────────────────
 const sendMessage = async () => {
-    const message = userInput.value;
+    const message = userInput.value.trim();
     if (!message || !currentConversationId) return;
 
     appendMessage(message, 'user', true);
-    userInput.value = '';
-    
-    // Disable send button while processing
+    userInput.value     = '';
     sendButton.disabled = true;
-    userInput.disabled = true;
-    
-    // Show loading indicator
+    userInput.disabled  = true;
     showLoading();
     addStep('Routing query...');
 
     try {
-        const response = await fetch(`${API_BASE}/prompt`, {
+        const res = await apiFetch('/prompt', {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-                message,
-                conversation_id: currentConversationId,
-                session_id: currentSessionId
-            })
+            body: JSON.stringify({ message, conversation_id: currentConversationId }),
         });
 
-        if (!response.ok) {
-            const errorData = await response.json();
-            throw new Error(errorData.detail || 'Failed to get response from the bot.');
+        if (!res.ok) {
+            const err = await res.json();
+            throw new Error(err.detail || 'Request failed');
         }
 
-        const data = await response.json();
-        const botMessage = data.message;
-        
-        // Hide loading indicator before showing bot message
-        setTimeout(() => {
-            hideLoading();
-            appendMessage(botMessage, 'bot', true);
-            // Reload conversations to update metadata
-            loadConversations();
-            
-            // Re-enable send button
-            sendButton.disabled = false;
-            userInput.disabled = false;
-            userInput.focus();
-        }, 500);
-    } catch (error) {
-        console.error(error);
+        const data = await res.json();
         hideLoading();
-        appendMessage(`Sorry, something went wrong: ${error.message}`, 'bot', true);
-        
-        // Re-enable send button
+        appendMessage(data.message, 'bot', true);
+        await loadConversations();   // refresh sidebar (updated title + count)
+
+    } catch (err) {
+        hideLoading();
+        appendMessage(`Error: ${err.message}`, 'bot', true);
+    } finally {
         sendButton.disabled = false;
-        userInput.disabled = false;
+        userInput.disabled  = false;
         userInput.focus();
     }
 };
 
-// Append message to chat
+// ─── Render message ───────────────────────────────────────────────────────────
 const appendMessage = (message, sender, scroll = true) => {
-    const messageElement = document.createElement('div');
-    messageElement.classList.add(`${sender}-message`);
+    const el = document.createElement('div');
+    el.classList.add(`${sender}-message`);
 
-    const mermaidRegex = /```mermaid\n([\s\S]*?)\n```/;
-    const match = message.match(mermaidRegex);
+    const match = message.match(/```mermaid\n([\s\S]*?)\n```/);
+    if (match) {
+        const code      = match[1].trim();
+        const container = document.createElement('div');
+        container.classList.add('mermaid-container');
 
-    if (match && match[1]) {
-        const mermaidCode = match[1].trim();
-
-        const mermaidContainer = document.createElement('div');
-        mermaidContainer.classList.add('mermaid-container');
-
-        // Use unique counter instead of timestamp to avoid collisions
-        const diagramId = `mermaid-${mermaidDiagramCount++}`;
+        const diagramId  = `mermaid-${mermaidDiagramCount++}`;
         const mermaidDiv = document.createElement('div');
-        mermaidDiv.id = diagramId;
+        mermaidDiv.id    = diagramId;
         mermaidDiv.classList.add('mermaid');
-        mermaidDiv.setAttribute('data-mermaid-code', mermaidCode);
-        mermaidDiv.textContent = mermaidCode;
+        mermaidDiv.setAttribute('data-mermaid-code', code);
+        mermaidDiv.textContent = code;
 
-        mermaidContainer.appendChild(mermaidDiv);
-
-        // Create action buttons container for this diagram
-        const actionsContainer = document.createElement('div');
-        actionsContainer.classList.add('diagram-actions');
+        const actions = document.createElement('div');
+        actions.classList.add('diagram-actions');
 
         const copyBtn = document.createElement('button');
         copyBtn.classList.add('diagram-action-btn');
-        copyBtn.title = 'Copy Mermaid Code';
+        copyBtn.title    = 'Copy Code';
         copyBtn.innerHTML = '<i class="fa-solid fa-copy"></i>';
-        copyBtn.onclick = () => {
-            navigator.clipboard.writeText(mermaidCode);
-            // Optional: Show a brief "Copied!" feedback
-            const originalHTML = copyBtn.innerHTML;
+        copyBtn.onclick  = () => {
+            navigator.clipboard.writeText(code);
             copyBtn.innerHTML = '<i class="fa-solid fa-check"></i>';
-            setTimeout(() => {
-                copyBtn.innerHTML = originalHTML;
-            }, 1000);
+            setTimeout(() => { copyBtn.innerHTML = '<i class="fa-solid fa-copy"></i>'; }, 1000);
         };
 
-        const downloadBtn = document.createElement('button');
-        downloadBtn.classList.add('diagram-action-btn');
-        downloadBtn.title = 'Download as Image';
-        downloadBtn.innerHTML = '<i class="fa-solid fa-download"></i>';
-        downloadBtn.onclick = () => {
-            domtoimage.toPng(mermaidDiv)
-                .then(function (dataUrl) {
-                    const link = document.createElement('a');
-                    link.download = 'mermaid-diagram.png';
-                    link.href = dataUrl;
-                    link.click();
-                });
+        const dlBtn = document.createElement('button');
+        dlBtn.classList.add('diagram-action-btn');
+        dlBtn.title    = 'Download PNG';
+        dlBtn.innerHTML = '<i class="fa-solid fa-download"></i>';
+        dlBtn.onclick  = () => {
+            domtoimage.toPng(mermaidDiv).then(url => {
+                const a    = document.createElement('a');
+                a.href     = url;
+                a.download = 'diagram.png';
+                a.click();
+            });
         };
 
-        actionsContainer.appendChild(copyBtn);
-        actionsContainer.appendChild(downloadBtn);
-        mermaidContainer.appendChild(actionsContainer);
+        actions.append(copyBtn, dlBtn);
+        container.append(mermaidDiv, actions);
+        el.appendChild(container);
+        chatBox.appendChild(el);
 
-        messageElement.appendChild(mermaidContainer);
-        chatBox.appendChild(messageElement);
-
-        // Render Mermaid diagram with proper cleanup
-        if (window.mermaid) {
-            // Use a small delay to ensure DOM is ready
-            setTimeout(() => {
-                mermaid.run({
-                    nodes: [mermaidDiv],
-                    suppressErrors: false
-                }).then(() => {
-                    // Check if the diagram actually rendered (mermaid replaces the text content with SVG)
-                    if (!mermaidDiv.querySelector('svg')) {
-                        // Rendering failed, show error message
-                        const errorMsg = document.createElement('div');
-                        errorMsg.style.color = '#ef4444';
-                        errorMsg.style.fontSize = '0.85rem';
-                        errorMsg.style.marginTop = '8px';
-                        errorMsg.textContent = '⚠️ Failed to render diagram';
-                        mermaidContainer.insertBefore(errorMsg, actionsContainer);
-                    }
-                }).catch((error) => {
-                    // Handle rendering errors
-                    console.error('Mermaid rendering error:', error);
-                    const errorMsg = document.createElement('div');
-                    errorMsg.style.color = '#ef4444';
-                    errorMsg.style.fontSize = '0.85rem';
-                    errorMsg.style.marginTop = '8px';
-                    errorMsg.textContent = `⚠️ Diagram error: ${error.message || 'Invalid syntax'}`;
-                    mermaidContainer.insertBefore(errorMsg, actionsContainer);
+        setTimeout(() => {
+            mermaid.run({ nodes: [mermaidDiv], suppressErrors: false })
+                .catch(err => {
+                    const errMsg = document.createElement('div');
+                    errMsg.style.color    = '#ef4444';
+                    errMsg.style.fontSize = '0.85rem';
+                    errMsg.textContent    = `⚠️ ${err.message || 'Render error'}`;
+                    container.insertBefore(errMsg, actions);
                 });
-            }, 100);
-        }
+        }, 100);
 
     } else {
-        messageElement.innerText = message;
-        chatBox.appendChild(messageElement);
+        el.innerText = message;
+        chatBox.appendChild(el);
     }
 
-    if (scroll) {
-        chatBox.scrollTop = chatBox.scrollHeight;
-    }
+    if (scroll) chatBox.scrollTop = chatBox.scrollHeight;
 };
 
-// Copy and download functionality is now handled per-diagram in the appendMessage function
+// ─── Utilities ────────────────────────────────────────────────────────────────
+function formatDate(date) {
+    const diff = Date.now() - date;
+    const days = Math.floor(diff / 86400000);
+    if (days === 0) return 'Today';
+    if (days === 1) return 'Yesterday';
+    if (days < 7)  return `${days}d ago`;
+    return date.toLocaleDateString();
+}
 
-// New chat button
+// ─── Event listeners ──────────────────────────────────────────────────────────
 newChatButton.addEventListener('click', createNewConversation);
-
-// Send button and enter key
 sendButton.addEventListener('click', sendMessage);
-userInput.addEventListener('keypress', (event) => {
-    if (event.key === 'Enter') {
-        sendMessage();
-    }
-});
+userInput.addEventListener('keypress', e => { if (e.key === 'Enter') sendMessage(); });
+sidebarToggle.addEventListener('click', () => sidebar.classList.toggle('hidden'));
 
-// Sidebar toggle for mobile
-sidebarToggle.addEventListener('click', () => {
-    sidebar.classList.toggle('hidden');
-});
-
-// Initialize the app
-init();
+// ─── Bootstrap: validate existing token or show login ─────────────────────────
+if (getToken()) {
+    fetch(`${API_BASE}/auth/me`, { headers: authHeaders() })
+        .then(r => {
+            if (!r.ok) throw new Error('invalid token');
+            return r.json();
+        })
+        .then(user => {
+            userEmailDisplay.textContent = user.email;
+            hideAuthModal();
+            init();
+        })
+        .catch(() => {
+            clearToken();
+            showAuthModal();
+        });
+} else {
+    showAuthModal();
+}

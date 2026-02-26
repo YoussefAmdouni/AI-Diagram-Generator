@@ -1,6 +1,6 @@
 <!DOCTYPE html>
 <html lang="en">
-
+<link rel="stylesheet" href="auth.css">    
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -10,13 +10,34 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css"
-        integrity="sha512-SnH5WK+bZxgPHs44uWIX+LLJAJ9/2PkPKZ5QiAj6Ta86w+fsb2TkcmfRyVX3pBnMFcV7oQPJkl9QevSCWr3W6A=="
-        crossorigin="anonymous" referrerpolicy="no-referrer" />
+          crossorigin="anonymous" referrerpolicy="no-referrer"/>
 </head>
-
 <body>
+
+<!-- ═══ Auth Modal ══════════════════════════════════════════════════════════ -->
+<div id="auth-modal" class="modal-overlay">
+    <div class="modal-card">
+        <h2 id="auth-title">Sign In</h2>
+        <form id="auth-form" autocomplete="on">
+            <div class="form-group">
+                <label for="auth-email">Email</label>
+                <input id="auth-email" type="email" placeholder="you@example.com" required autocomplete="email"/>
+            </div>
+            <div class="form-group">
+                <label for="auth-password">Password</label>
+                <input id="auth-password" type="password" placeholder="••••••••" required autocomplete="current-password"/>
+            </div>
+            <p id="auth-error" class="auth-error"></p>
+            <button type="submit" id="auth-submit" class="btn-primary">Sign In</button>
+        </form>
+        <button id="auth-toggle" class="btn-link">Don't have an account? Register</button>
+    </div>
+</div>
+
+<!-- ═══ Main UI ═════════════════════════════════════════════════════════════ -->
+<div id="main-ui" class="hidden">
     <div id="app-container">
-        <!-- Sidebar for conversation history -->
+        <!-- Sidebar -->
         <aside id="sidebar">
             <div id="sidebar-header">
                 <h2>Conversations</h2>
@@ -24,8 +45,13 @@
                     <i class="fa-solid fa-plus"></i>
                 </button>
             </div>
-            <div id="conversations-list">
-                <!-- Conversations will be dynamically loaded here -->
+            <div id="conversations-list"></div>
+            <!-- User info at bottom of sidebar -->
+            <div id="sidebar-footer">
+                <span id="user-email" class="user-email"></span>
+                <button id="logout-btn" title="Sign out">
+                    <i class="fa-solid fa-right-from-bracket"></i> Sign out
+                </button>
             </div>
         </aside>
 
@@ -41,7 +67,6 @@
             </header>
             <div id="chat-container">
                 <div id="chat-box"></div>
-                <!-- Loading indicator -->
                 <div id="loading-indicator" class="loading-indicator hidden">
                     <div class="spinner"></div>
                     <p class="thinking-text">Model is thinking<span class="dots">...</span></p>
@@ -54,12 +79,11 @@
             </div>
         </main>
     </div>
-    <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/dom-to-image-more@2.9.1/dist/dom-to-image-more.min.js"></script>
-    <script>
-        mermaid.initialize({ startOnLoad: true });
-    </script>
-    <script src="script.js"></script>
-</body>
+</div>
 
+<script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dom-to-image-more@2.9.1/dist/dom-to-image-more.min.js"></script>
+<script>mermaid.initialize({ startOnLoad: false });</script>
+<script src="script.js"></script>
+</body>
 </html>
