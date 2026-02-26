@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Designer Assistant</title>
+    <link rel="stylesheet" href="style.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css"
+        integrity="sha512-SnH5WK+bZxgPHs44uWIX+LLJAJ9/2PkPKZ5QiAj6Ta86w+fsb2TkcmfRyVX3pBnMFcV7oQPJkl9QevSCWr3W6A=="
+        crossorigin="anonymous" referrerpolicy="no-referrer" />
+</head>
+
+<body>
+    <div id="app-container">
+        <!-- Sidebar for conversation history -->
+        <aside id="sidebar">
+            <div id="sidebar-header">
+                <h2>Conversations</h2>
+                <button id="new-chat-button" title="New Chat">
+                    <i class="fa-solid fa-plus"></i>
+                </button>
+            </div>
+            <div id="conversations-list">
+                <!-- Conversations will be dynamically loaded here -->
+            </div>
+        </aside>
+
+        <!-- Main chat area -->
+        <main id="main-content">
+            <header>
+                <div id="header-left">
+                    <button id="sidebar-toggle" title="Toggle Sidebar">
+                        <i class="fa-solid fa-bars"></i>
+                    </button>
+                    <h1>AI Designer Assistant</h1>
+                </div>
+            </header>
+            <div id="chat-container">
+                <div id="chat-box"></div>
+                <!-- Loading indicator -->
+                <div id="loading-indicator" class="loading-indicator hidden">
+                    <div class="spinner"></div>
+                    <p class="thinking-text">Model is thinking<span class="dots">...</span></p>
+                    <div id="agent-steps" class="agent-steps"></div>
+                </div>
+                <div id="input-container">
+                    <input type="text" id="user-input" placeholder="Type your message here...">
+                    <button id="send-button">Send</button>
+                </div>
+            </div>
+        </main>
+    </div>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dom-to-image-more@2.9.1/dist/dom-to-image-more.min.js"></script>
+    <script>
+        mermaid.initialize({ startOnLoad: true });
+    </script>
+    <script src="script.js"></script>
+</body>
+
+</html>
