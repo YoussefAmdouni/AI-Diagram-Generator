@@ -8,6 +8,7 @@ import tempfile
 import os
 import shutil
 import re
+from agent import logger
 
 tavily = TavilySearchResults(max_results=2)
 
@@ -74,9 +75,9 @@ def mermaid_syntax_check(mermaid_code: str) -> dict:
     Returns:
         dict: {"valid": bool, "error": str or None}
     """
-    mmdc = shutil.which("mmdc.cmd")
+    mmdc = shutil.which("mmdc") or shutil.which("mmdc.cmd")
     if not mmdc:
-        return {"valid": False, "error": "Mermaid CLI not found"}
+        return {"valid": False, "error": "Mermaid CLI (mmdc) not found in PATH"}
 
     with tempfile.TemporaryDirectory() as tmpdir:
         mmd_file = os.path.join(tmpdir, "diagram.mmd")
@@ -85,18 +86,21 @@ def mermaid_syntax_check(mermaid_code: str) -> dict:
         with open(mmd_file, "w", encoding="utf-8") as f:
             f.write(mermaid_code)
 
-        result = subprocess.run(
-            [mmdc, "-i", mmd_file, "-o", out_file],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
+        try:
+            result = subprocess.run(
+                [mmdc, "-i", mmd_file, "-o", out_file],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=15,      
+            )
+        except subprocess.TimeoutExpired:
+            logger.warning("[mermaid_syntax_check] mmdc timed out after 15s")
+            return {"valid": False, "error": "Mermaid CLI timed out. Try a simpler diagram."}
+        except FileNotFoundError:
+            return {"valid": False, "error": f"Could not execute mmdc at path: {mmdc}"}
 
         if result.returncode != 0:
-            cleaned_error = clean_mermaid_error(result.stderr)
-            return {
-                "valid": False,
-                "error": cleaned_error
-            }
+            return {"valid": False, "error": clean_mermaid_error(result.stderr)}
 
         return {"valid": True, "error": None}
