@@ -3,7 +3,8 @@ warnings.filterwarnings("ignore")
 
 import os
 import logging
-from datetime import datetime
+import json
+from datetime import datetime, timezone
 from langgraph.graph import StateGraph, END
 from typing import TypedDict, List
 import asyncio
@@ -12,6 +13,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 
 from pydantic import BaseModel, Field
+from context import request_id_var
 
 from langchain_openai import ChatOpenAI 
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -24,33 +26,50 @@ load_dotenv('.env')
 # LOGGING SETUP
 # ============================================================================
 
+class JSONFormatter(logging.Formatter):
+    """Emit each log record as a single JSON line."""
+    def format(self, record: logging.LogRecord) -> str:
+        log_obj = {
+            "timestamp": datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(),
+            "level":     record.levelname,
+            "logger":    record.name,
+            "message":   record.getMessage(),
+            "module":    record.module,
+            "line":      record.lineno,
+            "request_id": request_id_var.get(),
+        }
+        if record.exc_info:
+            log_obj["exception"] = self.formatException(record.exc_info)
+        # Include any extra fields passed via extra={} in log calls
+        for key, val in record.__dict__.items():
+            if key not in {
+                "msg", "args", "levelname", "levelno", "pathname", "filename",
+                "module", "exc_info", "exc_text", "stack_info", "lineno",
+                "funcName", "created", "msecs", "relativeCreated", "thread",
+                "threadName", "processName", "process", "name", "message",
+            }:
+                log_obj[key] = val
+        return json.dumps(log_obj)
+
+
 LOGS_DIR = "agent_logs"
-if not os.path.exists(LOGS_DIR):
-    os.makedirs(LOGS_DIR)
+os.makedirs(LOGS_DIR, exist_ok=True)
 
-# Configure logging
-log_filename = os.path.join(LOGS_DIR, f"agent_conversation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(log_filename, encoding='utf-8'),
-        logging.StreamHandler()
-    ]
+# Rotating: max 10MB per file, keep 5 backups → max 50MB total log storage
+rotating_handler = logging.handlers.RotatingFileHandler(
+    filename=os.path.join(LOGS_DIR, "agent.log"),   # fixed name, not timestamped
+    maxBytes=10 * 1024 * 1024,                       # 10MB
+    backupCount=5,
+    encoding="utf-8",
 )
+rotating_handler.setFormatter(JSONFormatter())
+
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(JSONFormatter())
+
+logging.basicConfig(level=logging.INFO, handlers=[rotating_handler, console_handler])
 logger = logging.getLogger(__name__)
-logger.info("=" * 80)
 logger.info("Agent session started")
-logger.info("=" * 80)
-
-
-# ============================================================================
-# OPENAI CLIENT SETUP
-# ============================================================================
-# llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", temperature=0.3)
-llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.0)
-# safety_llm = ChatOpenAI(base_url="http://localhost:1234/v1", api_key="not-needed")
-
 
 # ============================================================================
 # PROMPT SETUP
@@ -77,6 +96,48 @@ tool_map = {
 }
 
 # ============================================================================
+# SAFETY CHECKER FUNCTION
+# ============================================================================
+import re 
+
+MAX_INPUT_LENGTH = 2000  # already have 8000 in main.py 
+
+# Patterns that are almost never legitimate in a diagram tool
+INJECTION_PATTERNS = [
+    r"ignore (previous|prior|above|all) instructions",
+    r"you are now",
+    r"act as (if you are|a|an)",
+    r"forget (your|all) (instructions|rules|constraints)",
+    r"repeat (the|your) (system )?prompt",
+    r"disregard (your|the) (previous|prior|system)",
+    r"jailbreak",
+    r"dan mode",
+]
+
+COMPILED_PATTERNS = [re.compile(p, re.IGNORECASE) for p in INJECTION_PATTERNS]
+
+def sanitize_input(text: str) -> tuple[str, bool]:
+    """
+    Returns (sanitized_text, was_flagged).
+    Does not block — flags for logging and strips known injection scaffolding.
+    Hard blocks only on pattern matches.
+    """
+    if len(text) > MAX_INPUT_LENGTH:
+        text = text[:MAX_INPUT_LENGTH]
+
+    for pattern in COMPILED_PATTERNS:
+        if pattern.search(text):
+            return text, True   # flag it — let unsafe_node handle response
+
+    return text, False
+
+CONTEXT_INJECTION_PATTERNS = [
+    re.compile(r"(ignore|disregard|forget).{0,30}(instruction|rule|prompt)", re.IGNORECASE),
+    re.compile(r"you are (now|a|an|DAN)", re.IGNORECASE),
+    re.compile(r"system prompt", re.IGNORECASE),
+]
+
+# ============================================================================
 # STATE & MODELS
 # ============================================================================
 
@@ -99,7 +160,33 @@ class OrchestratorDecision(BaseModel):
         description="Whether to route the query to the escalation workflow or answer directly or flag as unsafe"
     )
 
+# ============================================================================
+# OPENAI CLIENT SETUP
+# ============================================================================
+# llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", temperature=0.3)
+# llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.0)
+# safety_llm = ChatOpenAI(base_url="http://localhost:1234/v1", api_key="not-needed")
+_base_llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.0)
 
+llm = _base_llm.with_retry(
+    stop_after_attempt=3,
+    wait_exponential_jitter=True,   
+)
+
+structured_llm = _base_llm.with_structured_output(OrchestratorDecision).with_retry(
+    stop_after_attempt=3,
+    wait_exponential_jitter=True,
+)
+
+llm_direct = _base_llm.bind_tools([web_search_tool]).with_retry(
+    stop_after_attempt=3,
+    wait_exponential_jitter=True,
+)
+
+llm_mermaid = _base_llm.bind_tools([mermaid_syntax_check, web_search_tool]).with_retry(
+    stop_after_attempt=3,
+    wait_exponential_jitter=True,
+)
 # ============================================================================
 # NODE FUNCTIONS
 # ============================================================================
@@ -133,7 +220,14 @@ def extract_text_content(content) -> str:
     return str(content).strip()
 
 
-def orchestrator_node(state: AgentState) -> AgentState:
+async def orchestrator_node(state: AgentState) -> AgentState:
+    task, flagged = sanitize_input(state["task"])
+
+    if flagged:
+        logger.warning(f"[ORCHESTRATOR] Input flagged by sanitizer: {state['task'][:100]}")
+        state["route"] = "unsafe"
+        return state
+    
     logger.info(f"[ORCHESTRATOR] Routing query: {state['task'][:100]}")
 
     query_prompt = orchestrator_prompt.format(
@@ -141,8 +235,7 @@ def orchestrator_node(state: AgentState) -> AgentState:
         conversation_context=state["conversation_context"]
     )
 
-    structured_llm = llm.with_structured_output(OrchestratorDecision)
-    response = structured_llm.invoke(query_prompt)
+    response = await structured_llm.ainvoke(query_prompt)
 
     try:
         if response.route in {"unsafe", "workflow", "direct"}:
@@ -173,145 +266,78 @@ def unsafe_node(state: AgentState) -> AgentState:
     state["final_answer"] = SAFE_REFUSAL_MESSAGE
     return state
 
-
-def direct_node(state: AgentState) -> AgentState:
-    """
-    Answer using LLM knowledge (+ web if available).
-    """
-
-    logger.info(f"[DIRECT NODE] Answering query: {state['task'][:100]}")
-    prompt = generale_purpose_prompt.format(
-        query=state["task"],
-        conversation_context=state["conversation_context"]
-    )
-
-    tool_enabled_llm = llm.bind_tools([web_search_tool])
-
-    messages = [
-        {"role": "user", "content": prompt}
-    ]
-
-    try:
-        while True:
-            response = tool_enabled_llm.invoke(messages)
-
-            # If LLM gives final answer (no tool calls) → stop loop
-            if not getattr(response, "tool_calls", None):
-                # Extract text from response content
-                state["final_answer"] = extract_text_content(response.content)
-                return state
-
-            # Execute each requested tool call
-            for tool_call in response.tool_calls:
-                tool_name = tool_call["name"]
-                tool_args = tool_call["args"]
-                tool_call_id = tool_call.get("id")
-
-                logger.info(f"[DIRECT NODE] Tool requested: {tool_name}")
-
-                # Get the actual tool function from the map
-                tool_func = tool_map.get(tool_name)
-                if tool_func:
-                    tool_result = tool_func.invoke(tool_args)
-                else:
-                    tool_result = f"Tool {tool_name} not found"
-                
-                # Append assistant tool call message
-                messages.append(response)
-
-                # Append tool result so LLM can continue reasoning
-                tool_result_msg = {
-                    "role": "tool",
-                    "name": tool_name,
-                    "content": str(tool_result)
-                }
-                if tool_call_id:
-                    tool_result_msg["tool_call_id"] = tool_call_id
-                messages.append(tool_result_msg)
-
-    except Exception as e:
-        logger.error(f"[DIRECT NODE] Failure: {e}")
-        state["final_answer"] = (
-            "I ran into an issue while retrieving the information. "
-            "Please try again."
-        )
-        return state
-
-
-def mermaid_node(state: AgentState) -> AgentState:
-    """
-    Node to generate mermaid diagram based on user query.
-    """
-    logger.info(f"[MERMAID NODE] Generating diagram for: {state['task'][:100]}")
-    prompt = generale_purpose_prompt.format(
-        query=state["task"],
-        conversation_context=state["conversation_context"]
-    )
-
-    tool_enabled_llm = llm.bind_tools([mermaid_syntax_check, web_search_tool])
-
-    messages = [
-        {"role": "user", "content": prompt}
-    ]
-    
+async def run_tool_loop(llm_with_tools, initial_messages: list, max_iterations: int, node_name: str) -> str:
+    messages  = list(initial_messages)
     iteration = 0
 
+    while iteration < max_iterations:
+        iteration += 1
+        logger.info(f"[{node_name}] Iteration {iteration}/{max_iterations}")
+
+        response = await llm_with_tools.ainvoke(messages)   # async LLM call
+
+        if not getattr(response, "tool_calls", None):
+            return extract_text_content(response.content)
+
+        messages.append(response)
+        for tool_call in response.tool_calls:
+            tool_name    = tool_call["name"]
+            tool_args    = tool_call["args"]
+            tool_call_id = tool_call.get("id")
+
+            tool_func   = tool_map.get(tool_name)
+            # run sync tools in thread so they don't block the event loop
+            if tool_func:
+                tool_result = await asyncio.to_thread(tool_func.invoke, tool_args)
+            else:
+                tool_result = f"Tool '{tool_name}' not found"
+
+            tool_msg = {"role": "tool", "name": tool_name, "content": str(tool_result)}
+            if tool_call_id:
+                tool_msg["tool_call_id"] = tool_call_id
+            messages.append(tool_msg)
+
+    raise RuntimeError(f"{node_name} exceeded max iterations")
+
+
+async def mermaid_node(state: AgentState) -> AgentState:
+    prompt = mermaid_prompt.format(
+        query=state["task"],
+        conversation_context=state["conversation_context"]
+    )
     try:
-        while iteration < state["max_iterations"]:
-            iteration += 1
-            logger.info(f"[MERMAID NODE] Iteration {iteration}")
-
-            response = tool_enabled_llm.invoke(messages)
-
-            # If LLM returns final answer (no tool call) → assume it's the valid code
-            if not getattr(response, "tool_calls", None):
-                # Extract text from response content
-                state["final_answer"] = extract_text_content(response.content)
-                return state
-
-            # Execute tool calls
-            for tool_call in response.tool_calls:
-                tool_name = tool_call["name"]
-                tool_args = tool_call["args"]
-                tool_call_id = tool_call.get("id")
-
-                logger.info(f"[MERMAID NODE] Tool requested: {tool_name}")
-
-                # Get the actual tool function from the map
-                tool_func = tool_map.get(tool_name)
-                if tool_func:
-                    tool_result = tool_func.invoke(tool_args)
-                else:
-                    tool_result = f"Tool {tool_name} not found"
-                
-                # Append assistant tool call message
-                messages.append(response)
-
-                # Append tool result
-                tool_result_msg = {
-                    "role": "tool",
-                    "name": tool_name,
-                    "content": str(tool_result),
-                }
-                if tool_call_id:
-                    tool_result_msg["tool_call_id"] = tool_call_id
-                messages.append(tool_result_msg)
-        # Max iterations reached
-        logger.error("[MERMAID NODE] Max iterations reached.")
-        state["final_answer"] = (
-            "I couldn’t generate a valid Mermaid diagram within the allowed attempts. "
-            "Please try simplifying your request."
+        state["final_answer"] = await run_tool_loop(
+            llm_with_tools   = llm_mermaid,
+            initial_messages = [{"role": "user", "content": prompt}],
+            max_iterations   = state["max_iterations"],
+            node_name        = "MERMAID",
         )
-        return state
-
+    except RuntimeError as e:
+        state["final_answer"] = "I couldn't generate a valid diagram within the allowed attempts. Try simplifying your request."
     except Exception as e:
-        logger.error(f"[MERMAID NODE] Failure: {e}")
-        state["final_answer"] = (
-            "I ran into an issue while generating the diagram. "
-            "Please try again."
-        )
-        return state
+        logger.error(f"[MERMAID NODE] {e}", exc_info=True)
+        state["final_answer"] = "I ran into an issue generating the diagram. Please try again."
+    return state
 
+
+async def direct_node(state: AgentState) -> AgentState:
+    prompt = generale_purpose_prompt.format(
+        query=state["task"],
+        conversation_context=state["conversation_context"]
+    )
+    try:
+        state["final_answer"] = await run_tool_loop(
+            llm_with_tools   = llm_direct,
+            initial_messages = [{"role": "user", "content": prompt}],
+            max_iterations   = state["max_iterations"],
+            node_name        = "DIRECT",
+        )
+    except RuntimeError as e:
+        state["final_answer"] = "I couldn't retrieve the information. Please try again."
+    except Exception as e:
+        logger.error(f"[DIRECT NODE] {e}", exc_info=True)
+        state["final_answer"] = "I ran into an issue. Please try again."
+    return state
 
 # ============================================================================
 # GRAPH CONSTRUCTION
@@ -345,7 +371,7 @@ def should_run_workflow(state: AgentState) -> str:
         return "direct"
 
 
-def build_sequential_graph(checkpointer):
+def build_sequential_graph():
     """
     Build and compile the multi-agent workflow graph.
     """
@@ -377,19 +403,15 @@ def build_sequential_graph(checkpointer):
     builder.add_edge("direct", END)
     builder.add_edge("unsafe", END)
 
-    # Compile with checkpointer
-    graph = builder.compile(checkpointer=checkpointer)
 
-    logger.info("Agent workflow graph compiled successfully")
-
-    return graph    
+    return builder.compile()  
 
 
 # ============================================================================
 # API FUNCTIONS FOR FASTAPI INTEGRATION
 # ============================================================================
 
-def _format_conversation_context(conversation_history: List[dict]) -> str:
+def _format_conversation_context(conversation_history: list[dict]) -> str:
     """
     Format conversation history into a readable context string for the agent.
     
@@ -401,68 +423,55 @@ def _format_conversation_context(conversation_history: List[dict]) -> str:
     """
     if not conversation_history:
         return "No prior conversation context."
-    
+
     formatted = "Prior conversation context:\n"
-    for msg in conversation_history[-10:]:  # Use last 10 messages for context
-        msg_type = msg.get("type", "unknown").upper()
+    for msg in conversation_history[-10:]:
         content = msg.get("content", "")
+
+        # Sanitize stored messages before re-injecting them into new prompts
+        is_suspicious = any(p.search(content) for p in CONTEXT_INJECTION_PATTERNS)
+        if is_suspicious:
+            logger.warning(f"[CONTEXT] Suspicious content stripped from context: {content[:80]}")
+            content = "[message removed]"
+
+        msg_type = msg.get("type", "unknown").upper()
         formatted += f"{msg_type}: {content}\n"
-    
+
     return formatted.strip()
 
+MAX_ITERATIONS = int(os.getenv("AGENT_MAX_ITERATIONS", "5")) 
 
-async def get_response(user_message: str, conversation_id: str, conversation_history: List[dict] = None) -> str:
+async def get_response(user_message: str, conversation_history: list = None) -> str:
     """
     Get an agent response for a user message.
     This is the main API function called by FastAPI endpoints.
     
     Args:
         user_message: The user's input message
-        conversation_id: Unique identifier for conversation context
         conversation_history: Optional list of prior messages in the conversation
         
     Returns:
         str: The agent's response text
     """
     try:
-        checkpointer = MemorySaver()
-        graph = build_sequential_graph(checkpointer)
-        
-        # Create thread for conversation persistence
-        thread = {"configurable": {"thread_id": conversation_id}}
-        
-        # Format conversation context from history
-        context_str = _format_conversation_context(conversation_history or [])
-        
-        # Create initial state with prior conversation context
+        graph         = build_sequential_graph()
+        context_str   = _format_conversation_context(conversation_history or [])
         initial_state = AgentState(
             task=user_message,
             conversation_context=context_str,
             route="",
-            max_iterations=3,
+            max_iterations=MAX_ITERATIONS,
             final_answer="",
         )
-        
-        # Invoke the graph
-        result = await asyncio.to_thread(graph.invoke, initial_state, thread)
-        
-        response_text = ""
-        if isinstance(result, dict):
-            response_text = result.get("final_answer", "")
-        else:
-            response_text = getattr(result, "final_answer", "")
 
-        if not response_text:
-            response_text = (
-                "I couldn’t generate a response at the moment. "
-                "Please try again."
-            )
-        return response_text
-        
+        # ainvoke keeps everything on the event loop — no thread blocking
+        result = await graph.ainvoke(initial_state)
+        return result.get("final_answer") or "I couldn't generate a response. Please try again."
+
     except Exception as e:
-        logger.error(f"Error in get_response: {str(e)}", exc_info=True)
+        logger.error(f"[get_response] {e}", exc_info=True)
         return f"Error processing your request: {str(e)}"
-    
+
 
 
 async def get_conversation_messages(conversation_id: str) -> list:
