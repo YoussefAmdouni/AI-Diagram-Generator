@@ -1,6 +1,5 @@
 """
 Authentication: JWT tokens + bcrypt password hashing.
-Uses `bcrypt` directly (replaces passlib which has bcrypt>=4.x compatibility issues).
 """
 import os
 from datetime import datetime, timedelta, timezone
@@ -17,7 +16,10 @@ from sqlalchemy import select
 from database import User, get_db
 
 # ─── Config ───────────────────────────────────────────────────────────────────
-SECRET_KEY = os.getenv("SECRET_KEY", "change-me-in-production-use-openssl-rand-hex-32")
+SECRET_KEY = os.getenv("SECRET_KEY")
+if not SECRET_KEY:
+    raise RuntimeError("SECRET_KEY environment variable is not set. Server cannot start.")
+
 ALGORITHM  = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", str(60 * 24)))
 

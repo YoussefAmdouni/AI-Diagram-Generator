@@ -3,6 +3,7 @@ Semi-prod FastAPI backend.
 """
 import os
 import uuid
+from context import request_id_var
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -68,6 +69,16 @@ else:
         max_age=600,
     )
 
+
+# ─── Request ID middleware ─────────────────────────────────────────────────────
+@app.middleware("http")
+async def attach_request_id(request: Request, call_next):
+    req_id = str(uuid.uuid4())[:8]
+    request_id_var.set(req_id)
+    request.state.request_id = req_id
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = req_id
+    return response
 
 # ─── Auth routes ───────────────────────────────────────────────────────────────
 app.include_router(auth_router)
@@ -254,7 +265,7 @@ async def handle_prompt(
     ]
 
     logger.info(f"[{current_user.email}][{conv.id}] USER: {user_message[:80]}")
-    response_text = await get_response(user_message, conv.id, context)
+    response_text = await get_response(user_message, context)
 
     # Persist assistant message
     db.add(Message(conversation_id=conv.id, role="assistant", content=response_text))
