@@ -81,7 +81,7 @@ SECRET_KEY=your_secret_key
 ACCESS_TOKEN_EXPIRE_MINUTES=1440
 DEV_MODE=true
 DATABASE_URL=sqlite+aiosqlite:///./mermaid_app.db
-```
+``` 
 
 ### 3. Run
 ```bash
