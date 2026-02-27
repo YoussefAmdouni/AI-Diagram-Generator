@@ -5,9 +5,10 @@ import os
 import uuid
 from context import request_id_var
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+from jose import jwt
 
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -28,7 +29,22 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ─── Rate limiter ──────────────────────────────────────────────────────────────
-limiter = Limiter(key_func=get_remote_address, default_limits=["20/minute"])
+SECRET_KEY = os.getenv("SECRET_KEY")
+if not SECRET_KEY:
+    raise RuntimeError("SECRET_KEY environment variable is not set. Server cannot start.")
+
+def get_user_or_ip(request: Request) -> str:
+    # Use user ID from token if authenticated, fall back to IP
+    token = request.headers.get("Authorization", "")
+    if token:
+        try:
+            payload = jwt.decode(token.replace("Bearer ", ""), SECRET_KEY, algorithms=["HS256"])
+            return f"user:{payload.get('sub', get_remote_address(request))}"
+        except Exception:
+            pass
+    return get_remote_address(request)
+
+limiter = Limiter(key_func=get_user_or_ip)
 
 
 # ─── Lifespan ──────────────────────────────────────────────────────────────────
@@ -99,9 +115,18 @@ class PromptResponse(BaseModel):
 
 # ─── Health ────────────────────────────────────────────────────────────────────
 @app.get("/health")
-async def health():
-    return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
-
+async def health(db: AsyncSession = Depends(get_db)):
+    try:
+        await db.execute(select(1))
+        db_status = "ok"
+    except Exception as e:
+        db_status = f"error: {str(e)}"
+    
+    return {
+        "status": "ok" if db_status == "ok" else "degraded",
+        "db": db_status,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
 
 # ─── Conversations ─────────────────────────────────────────────────────────────
 @app.get("/api/conversations")
