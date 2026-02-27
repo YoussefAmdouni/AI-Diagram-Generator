@@ -17,13 +17,17 @@ from database import User, get_db
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 SECRET_KEY = os.getenv("SECRET_KEY")
+
 if not SECRET_KEY:
     raise RuntimeError("SECRET_KEY environment variable is not set. Server cannot start.")
 
 if len(SECRET_KEY) < 32:
-    raise RuntimeError("SECRET_KEY must be at least 32 characters")
+    raise RuntimeError(
+        "SECRET_KEY is too short — minimum 32 characters required. "
+        "Generate a safe key with:  openssl rand -hex 32"
+    )
 
-ALGORITHM  = "HS256"
+ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", str(60 * 24)))
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
@@ -34,6 +38,7 @@ class UserRegister(BaseModel):
     email: str
     password: str
 
+
 class UserOut(BaseModel):
     id: str
     email: str
@@ -41,19 +46,19 @@ class UserOut(BaseModel):
     created_at: datetime
     model_config = {"from_attributes": True}
 
+
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     user: UserOut
 
 
-# ─── Password helpers (direct bcrypt, no passlib) ─────────────────────────────
+# ─── Password helpers ─────────────────────────────────────────────────────────
 def hash_password(password: str) -> str:
-    """Hash a plaintext password using bcrypt."""
     return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
 
+
 def verify_password(plain: str, hashed: str) -> bool:
-    """Verify a plaintext password against a bcrypt hash."""
     try:
         return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
     except Exception:
@@ -79,7 +84,7 @@ async def get_current_user(
         headers={"WWW-Authenticate": "Bearer"},
     )
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        payload  = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         user_id: str = payload.get("sub")
         if not user_id:
             raise exc
@@ -87,7 +92,7 @@ async def get_current_user(
         raise exc
 
     result = await db.execute(select(User).where(User.id == user_id))
-    user = result.scalar_one_or_none()
+    user   = result.scalar_one_or_none()
     if not user:
         raise exc
     return user
@@ -105,13 +110,15 @@ auth_router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 @auth_router.post("/register", response_model=TokenResponse, status_code=201)
 async def register(body: UserRegister, db: AsyncSession = Depends(get_db)):
-    # Check for existing email
     existing = await db.execute(select(User).where(User.email == body.email))
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=400, detail="Email already registered")
 
-    if len(body.password) < 6:
-        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+    if len(body.password) < 8:
+        raise HTTPException(
+            status_code=400,
+            detail="Password must be at least 8 characters",
+        )
 
     user = User(email=body.email, hashed_password=hash_password(body.password))
     db.add(user)
@@ -126,7 +133,7 @@ async def register(body: UserRegister, db: AsyncSession = Depends(get_db)):
 async def login(form: OAuth2PasswordRequestForm = Depends(), db: AsyncSession = Depends(get_db)):
     """OAuth2 form login — email goes in the `username` field."""
     result = await db.execute(select(User).where(User.email == form.username))
-    user = result.scalar_one_or_none()
+    user   = result.scalar_one_or_none()
 
     if not user or not verify_password(form.password, user.hashed_password):
         raise HTTPException(

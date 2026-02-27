@@ -1,8 +1,9 @@
 """
-Semi-prod FastAPI backend.
+FastAPI backend.
 """
 import os
 import uuid
+import asyncio
 from context import request_id_var
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -19,22 +20,21 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
-from sqlalchemy.orm import selectinload
 
-from agent import get_response, logger
+from agent import get_response, logger, CONVERSATION_CONTEXT_LIMIT
 from auth import auth_router, require_active_user
 from database import create_tables, get_db, User, Conversation, Message
 
 from dotenv import load_dotenv
 load_dotenv()
 
-# ─── Rate limiter ──────────────────────────────────────────────────────────────
+# ─── Config ────────────────────────────────────────────────────────────────────
 SECRET_KEY = os.getenv("SECRET_KEY")
 if not SECRET_KEY:
     raise RuntimeError("SECRET_KEY environment variable is not set. Server cannot start.")
 
+# ─── Rate limiter ──────────────────────────────────────────────────────────────
 def get_user_or_ip(request: Request) -> str:
-    # Use user ID from token if authenticated, fall back to IP
     token = request.headers.get("Authorization", "")
     if token:
         try:
@@ -96,6 +96,7 @@ async def attach_request_id(request: Request, call_next):
     response.headers["X-Request-ID"] = req_id
     return response
 
+
 # ─── Auth routes ───────────────────────────────────────────────────────────────
 app.include_router(auth_router)
 
@@ -121,12 +122,12 @@ async def health(db: AsyncSession = Depends(get_db)):
         db_status = "ok"
     except Exception as e:
         db_status = f"error: {str(e)}"
-    
     return {
         "status": "ok" if db_status == "ok" else "degraded",
         "db": db_status,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+
 
 # ─── Conversations ─────────────────────────────────────────────────────────────
 @app.get("/api/conversations")
@@ -136,13 +137,11 @@ async def list_conversations(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_active_user),
 ):
-    # Use a subquery to count messages without lazy loading
     msg_count_subq = (
         select(Message.conversation_id, func.count(Message.id).label("cnt"))
         .group_by(Message.conversation_id)
         .subquery()
     )
-
     result = await db.execute(
         select(Conversation, func.coalesce(msg_count_subq.c.cnt, 0).label("message_count"))
         .outerjoin(msg_count_subq, Conversation.id == msg_count_subq.c.conversation_id)
@@ -150,14 +149,13 @@ async def list_conversations(
         .order_by(Conversation.updated_at.desc())
     )
     rows = result.all()
-
     return {
         "conversations": [
             {
-                "id": conv.id,
-                "title": conv.title,
-                "created_at": conv.created_at,
-                "updated_at": conv.updated_at,
+                "id":            conv.id,
+                "title":         conv.title,
+                "created_at":    conv.created_at,
+                "updated_at":    conv.updated_at,
                 "message_count": count,
             }
             for conv, count in rows
@@ -184,10 +182,10 @@ async def create_conversation(
     await db.refresh(conv)
     logger.info(f"[{current_user.email}] Created conversation {conv.id}")
     return {
-        "id": conv.id,
-        "title": conv.title,
-        "created_at": conv.created_at,
-        "updated_at": conv.updated_at,
+        "id":            conv.id,
+        "title":         conv.title,
+        "created_at":    conv.created_at,
+        "updated_at":    conv.updated_at,
         "message_count": 0,
     }
 
@@ -223,7 +221,6 @@ async def get_messages(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_active_user),
 ):
-    # Ownership check
     conv_result = await db.execute(
         select(Conversation).where(
             Conversation.id == conversation_id,
@@ -236,7 +233,7 @@ async def get_messages(
     msg_result = await db.execute(
         select(Message)
         .where(Message.conversation_id == conversation_id)
-        .order_by(Message.created_at.asc())   # oldest first for chat display
+        .order_by(Message.created_at.asc())
         .limit(limit)
     )
     messages = msg_result.scalars().all()
@@ -273,16 +270,15 @@ async def handle_prompt(
     if len(user_message) > 8000:
         raise HTTPException(status_code=400, detail="Message too long (max 8000 chars)")
 
-    # Persist user message
     db.add(Message(conversation_id=conv.id, role="user", content=user_message))
     await db.flush()
 
-    # Build context from last 10 messages (explicit async query, no lazy load)
+    # Use CONVERSATION_CONTEXT_LIMIT from agent.py — single source of truth
     history_result = await db.execute(
         select(Message)
         .where(Message.conversation_id == conv.id)
         .order_by(Message.created_at.desc())
-        .limit(10)
+        .limit(CONVERSATION_CONTEXT_LIMIT)
     )
     context = [
         {"type": m.role, "content": m.content}
@@ -290,19 +286,26 @@ async def handle_prompt(
     ]
 
     logger.info(f"[{current_user.email}][{conv.id}] USER: {user_message[:80]}")
-    response_text = await get_response(user_message, context)
 
-    # Persist assistant message
+    # Issue 9 (from earlier review): wrap with a timeout so a hung LLM call
+    # doesn't hold the request open indefinitely.
+    try:
+        response_text = await asyncio.wait_for(
+            get_response(user_message, context),
+            timeout=120.0,
+        )
+    except asyncio.TimeoutError:
+        logger.error(f"[{current_user.email}][{conv.id}] Agent timed out after 120 s")
+        raise HTTPException(status_code=504, detail="The AI took too long to respond. Please try again.")
+
     db.add(Message(conversation_id=conv.id, role="assistant", content=response_text))
 
-    # Update title on first real message
     if conv.title == "New Conversation":
         conv.title = user_message[:50] + ("..." if len(user_message) > 50 else "")
 
-    # Explicitly set updated_at so sidebar ordering works
     conv.updated_at = datetime.utcnow()
-
     await db.commit()
+
     logger.info(f"[{current_user.email}][{conv.id}] BOT: {response_text[:80]}")
     return PromptResponse(message=response_text, conversation_id=conv.id)
 
