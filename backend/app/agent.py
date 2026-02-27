@@ -3,6 +3,7 @@ warnings.filterwarnings("ignore")
 
 import os
 import logging
+import logging.handlers
 import json
 from datetime import datetime, timezone
 from langgraph.graph import StateGraph, END
@@ -100,7 +101,7 @@ tool_map = {
 # ============================================================================
 import re 
 
-MAX_INPUT_LENGTH = 2000  # already have 8000 in main.py 
+MAX_INPUT_LENGTH = 8000   
 
 # Patterns that are almost never legitimate in a diagram tool
 INJECTION_PATTERNS = [
@@ -440,6 +441,7 @@ def _format_conversation_context(conversation_history: list[dict]) -> str:
     return formatted.strip()
 
 MAX_ITERATIONS = int(os.getenv("AGENT_MAX_ITERATIONS", "5")) 
+_graph = build_sequential_graph()
 
 async def get_response(user_message: str, conversation_history: list = None) -> str:
     """
@@ -454,7 +456,6 @@ async def get_response(user_message: str, conversation_history: list = None) -> 
         str: The agent's response text
     """
     try:
-        graph         = build_sequential_graph()
         context_str   = _format_conversation_context(conversation_history or [])
         initial_state = AgentState(
             task=user_message,
@@ -465,32 +466,9 @@ async def get_response(user_message: str, conversation_history: list = None) -> 
         )
 
         # ainvoke keeps everything on the event loop — no thread blocking
-        result = await graph.ainvoke(initial_state)
+        result = await _graph.ainvoke(initial_state)
         return result.get("final_answer") or "I couldn't generate a response. Please try again."
 
     except Exception as e:
         logger.error(f"[get_response] {e}", exc_info=True)
         return f"Error processing your request: {str(e)}"
-
-
-
-async def get_conversation_messages(conversation_id: str) -> list:
-    """
-    Get conversation history for a conversation ID.
-    This retrieves stored messages from the conversation persistence layer.
-    
-    Args:
-        conversation_id: Unique identifier for the conversation
-        
-    Returns:
-        list: List of message dictionaries with 'type', 'content', and 'timestamp'
-    """
-    try:
-        # For now, return empty list as the conversation is managed by SessionManager in main.py
-        # The actual messages are stored in SessionManager's session memory
-        logger.info(f"[{conversation_id}] Retrieved conversation history")
-        return []
-        
-    except Exception as e:
-        logger.error(f"Error in get_conversation_messages: {str(e)}", exc_info=True)
-        return []
