@@ -1,19 +1,20 @@
 """
-FastAPI backend.
+FastAPI backend — SSE streaming, proper error handling, token refresh.
 """
 import os
 import uuid
 import asyncio
-from context import request_id_var
+import json
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, AsyncIterator
 from jose import jwt
 
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -21,7 +22,7 @@ from slowapi.util import get_remote_address
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 
-from agent import get_response, logger, CONVERSATION_CONTEXT_LIMIT
+from agent import stream_response, get_response, logger, CONVERSATION_CONTEXT_LIMIT
 from auth import auth_router, require_active_user
 from database import create_tables, get_db, User, Conversation, Message
 
@@ -31,7 +32,7 @@ load_dotenv()
 # ─── Config ────────────────────────────────────────────────────────────────────
 SECRET_KEY = os.getenv("SECRET_KEY")
 if not SECRET_KEY:
-    raise RuntimeError("SECRET_KEY environment variable is not set. Server cannot start.")
+    raise RuntimeError("SECRET_KEY environment variable is not set.")
 
 # ─── Rate limiter ──────────────────────────────────────────────────────────────
 def get_user_or_ip(request: Request) -> str:
@@ -47,7 +48,6 @@ def get_user_or_ip(request: Request) -> str:
 limiter = Limiter(key_func=get_user_or_ip)
 
 
-# ─── Lifespan ──────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await create_tables()
@@ -60,22 +60,16 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # ─── CORS ──────────────────────────────────────────────────────────────────────
-DEV_MODE = os.getenv("DEV_MODE", "true").lower() == "true"
+DEV_MODE = os.getenv("DEV_MODE", "false").lower() == "true"  # safe default
 
 if DEV_MODE:
-    logger.info("CORS: DEV_MODE=true — allowing all origins")
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=False,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    logger.warning("CORS: DEV_MODE=true — allowing all origins. Do NOT use in production.")
+    app.add_middleware(CORSMiddleware, allow_origins=["*"],
+                       allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 else:
     ALLOWED_ORIGINS = [o.strip() for o in os.getenv(
         "ALLOWED_ORIGINS", "http://localhost:8000,http://127.0.0.1:8000"
     ).split(",")]
-    logger.info(f"CORS: production — allowed origins: {ALLOWED_ORIGINS}")
     app.add_middleware(
         CORSMiddleware,
         allow_origins=ALLOWED_ORIGINS,
@@ -89,6 +83,7 @@ else:
 # ─── Request ID middleware ─────────────────────────────────────────────────────
 @app.middleware("http")
 async def attach_request_id(request: Request, call_next):
+    from context import request_id_var
     req_id = str(uuid.uuid4())[:8]
     request_id_var.set(req_id)
     request.state.request_id = req_id
@@ -97,7 +92,6 @@ async def attach_request_id(request: Request, call_next):
     return response
 
 
-# ─── Auth routes ───────────────────────────────────────────────────────────────
 app.include_router(auth_router)
 
 
@@ -106,11 +100,7 @@ class ConversationCreate(BaseModel):
     title: Optional[str] = "New Conversation"
 
 class PromptRequest(BaseModel):
-    message: str
-    conversation_id: str
-
-class PromptResponse(BaseModel):
-    message: str
+    message:         str
     conversation_id: str
 
 
@@ -121,10 +111,11 @@ async def health(db: AsyncSession = Depends(get_db)):
         await db.execute(select(1))
         db_status = "ok"
     except Exception as e:
-        db_status = f"error: {str(e)}"
+        db_status = f"error"
+        logger.error(f"[HEALTH] DB check failed: {e}")
     return {
-        "status": "ok" if db_status == "ok" else "degraded",
-        "db": db_status,
+        "status":    "ok" if db_status == "ok" else "degraded",
+        "db":        db_status,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -134,32 +125,34 @@ async def health(db: AsyncSession = Depends(get_db)):
 @limiter.limit("60/minute")
 async def list_conversations(
     request: Request,
+    page: int = 1,
+    page_size: int = 20,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_active_user),
 ):
+    if page < 1:       page = 1
+    if page_size > 50: page_size = 50
+    offset = (page - 1) * page_size
+
     msg_count_subq = (
         select(Message.conversation_id, func.count(Message.id).label("cnt"))
-        .group_by(Message.conversation_id)
-        .subquery()
+        .group_by(Message.conversation_id).subquery()
     )
     result = await db.execute(
         select(Conversation, func.coalesce(msg_count_subq.c.cnt, 0).label("message_count"))
         .outerjoin(msg_count_subq, Conversation.id == msg_count_subq.c.conversation_id)
         .where(Conversation.user_id == current_user.id)
         .order_by(Conversation.updated_at.desc())
+        .offset(offset).limit(page_size)
     )
     rows = result.all()
     return {
         "conversations": [
-            {
-                "id":            conv.id,
-                "title":         conv.title,
-                "created_at":    conv.created_at,
-                "updated_at":    conv.updated_at,
-                "message_count": count,
-            }
-            for conv, count in rows
-        ]
+            {"id": c.id, "title": c.title, "created_at": c.created_at,
+             "updated_at": c.updated_at, "message_count": count}
+            for c, count in rows
+        ],
+        "page": page, "page_size": page_size,
     }
 
 
@@ -175,19 +168,14 @@ async def create_conversation(
         id=str(uuid.uuid4()),
         user_id=current_user.id,
         title=body.title or "New Conversation",
-        updated_at=datetime.utcnow(),
+        updated_at=datetime.now(timezone.utc),
     )
     db.add(conv)
     await db.commit()
     await db.refresh(conv)
     logger.info(f"[{current_user.email}] Created conversation {conv.id}")
-    return {
-        "id":            conv.id,
-        "title":         conv.title,
-        "created_at":    conv.created_at,
-        "updated_at":    conv.updated_at,
-        "message_count": 0,
-    }
+    return {"id": conv.id, "title": conv.title, "created_at": conv.created_at,
+            "updated_at": conv.updated_at, "message_count": 0}
 
 
 @app.delete("/api/conversations/{conversation_id}")
@@ -234,7 +222,7 @@ async def get_messages(
         select(Message)
         .where(Message.conversation_id == conversation_id)
         .order_by(Message.created_at.asc())
-        .limit(limit)
+        .limit(min(limit, 100))
     )
     messages = msg_result.scalars().all()
     return {
@@ -245,15 +233,23 @@ async def get_messages(
     }
 
 
-# ─── Prompt ────────────────────────────────────────────────────────────────────
-@app.post("/api/prompt", response_model=PromptResponse)
+# ─── Streaming prompt ──────────────────────────────────────────────────────────
+@app.post("/api/prompt/stream")
 @limiter.limit("20/minute")
-async def handle_prompt(
+async def handle_prompt_stream(
     request: Request,
     body: PromptRequest,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_active_user),
 ):
+    """
+    SSE endpoint. Streams LLM response chunks as they arrive.
+    Events:
+      data: {"type": "chunk",  "content": "..."}
+      data: {"type": "done",   "conversation_id": "..."}
+      data: {"type": "error",  "message": "..."}
+    """
+    # ── Validate conversation ownership ──
     conv_result = await db.execute(
         select(Conversation).where(
             Conversation.id == body.conversation_id,
@@ -270,10 +266,10 @@ async def handle_prompt(
     if len(user_message) > 8000:
         raise HTTPException(status_code=400, detail="Message too long (max 8000 chars)")
 
+    # ── Save user message ──
     db.add(Message(conversation_id=conv.id, role="user", content=user_message))
     await db.flush()
 
-    # Use CONVERSATION_CONTEXT_LIMIT from agent.py — single source of truth
     history_result = await db.execute(
         select(Message)
         .where(Message.conversation_id == conv.id)
@@ -284,42 +280,67 @@ async def handle_prompt(
         {"type": m.role, "content": m.content}
         for m in reversed(history_result.scalars().all())
     ]
-
-    logger.info(f"[{current_user.email}][{conv.id}] USER: {user_message[:80]}")
-
-    # Issue 9 (from earlier review): wrap with a timeout so a hung LLM call
-    # doesn't hold the request open indefinitely.
-    try:
-        response_text = await asyncio.wait_for(
-            get_response(user_message, context),
-            timeout=120.0,
-        )
-    except asyncio.TimeoutError:
-        logger.error(f"[{current_user.email}][{conv.id}] Agent timed out after 120 s")
-        raise HTTPException(status_code=504, detail="The AI took too long to respond. Please try again.")
-
-    db.add(Message(conversation_id=conv.id, role="assistant", content=response_text))
-
-    if conv.title == "New Conversation":
-        conv.title = user_message[:50] + ("..." if len(user_message) > 50 else "")
-
-    conv.updated_at = datetime.utcnow()
     await db.commit()
 
-    logger.info(f"[{current_user.email}][{conv.id}] BOT: {response_text[:80]}")
-    return PromptResponse(message=response_text, conversation_id=conv.id)
+    logger.info(f"[{current_user.email}][{conv.id}] STREAM START: {user_message[:80]}")
 
+    async def event_generator() -> AsyncIterator[str]:
+        full_response = ""
+        try:
+            async for chunk in stream_response(user_message, context):
+                if chunk == "__DONE__":
+                    break
+                full_response = chunk  # single chunk — just capture it
+                payload = json.dumps({"type": "chunk", "content": chunk})
+                yield f"data: {payload}\n\n"
 
+        except asyncio.CancelledError:
+            logger.info(f"[{current_user.email}][{conv.id}] Client disconnected")
+        except Exception as e:
+            logger.error(f"[STREAM] Generator error: {e}", exc_info=True)
+            err = json.dumps({"type": "error", "message": "An error occurred. Please try again."})
+            yield f"data: {err}\n\n"
+
+        # ── Persist assistant response using a fresh session ──
+        if full_response:
+            try:
+                from database import AsyncSessionLocal
+                async with AsyncSessionLocal() as save_session:
+                    c = await save_session.get(Conversation, conv.id)
+                    if c:
+                        save_session.add(Message(
+                            conversation_id = c.id,
+                            role            = "assistant",
+                            content         = full_response,
+                        ))
+                        if c.title == "New Conversation":
+                            c.title = user_message[:50] + ("..." if len(user_message) > 50 else "")
+                        c.updated_at = datetime.now(timezone.utc)
+                        await save_session.commit()
+                        logger.info(f"[{current_user.email}][{conv.id}] Saved: {full_response[:80]}")
+            except Exception as e:
+                logger.error(f"[STREAM] Save failed: {e}", exc_info=True)
+
+        done = json.dumps({"type": "done", "conversation_id": conv.id})
+        yield f"data: {done}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control":     "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 # ─── Static frontend ───────────────────────────────────────────────────────────
 frontend_path = Path(__file__).parent.parent.parent / "frontend"
 if frontend_path.exists():
     app.mount("/", StaticFiles(directory=str(frontend_path), html=True), name="frontend")
     logger.info(f"Serving frontend from {frontend_path}")
 else:
-    logger.warning(f"Frontend not found at {frontend_path} — serve it separately")
+    logger.warning(f"Frontend not found at {frontend_path}")
 
 
-# ─── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
