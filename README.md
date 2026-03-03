@@ -1,169 +1,106 @@
-# 🎨 AI Diagram Generator - Mermaid Assistant
+# AI Diagram Assistant
 
-Generate Mermaid diagrams from natural language using AI. Built with FastAPI, LangGraph, Google Gemini, and Vanilla JS.
+A conversational AI assistant that generates and validates Mermaid diagrams, with full user authentication and streaming responses.
 
----
+## Stack
 
-## ✨ Features
+| Layer    | Tech                                                        |
+|----------|-------------------------------------------------------------|
+| Backend  | FastAPI, LangChain                                          |
+| LLMs     | Gemini 2.5 Flash (main), Gemini 2.0 Flash-Lite (safety)    |
+| Tools    | Tavily web search, Mermaid CLI syntax validation            |
+| Database | Neon (Postgres) via SQLAlchemy async + asyncpg              |
+| Auth     | JWT access tokens (15min) + refresh tokens (30 days, DB-backed) |
+| Frontend | Vanilla JS, SSE streaming, Mermaid.js rendering             |
 
-- **AI-Powered Diagram Generation** - Google Gemini converts natural language to Mermaid code
-- **Multi-turn Conversations** - Persistent conversation threads with message history
-- **User Authentication** - JWT-based auth with bcrypt password hashing
-- **Real-time Rendering** - Instant Mermaid diagram preview
-- **Persistent Storage** - SQLite/PostgreSQL database for conversations and users
-- **Web Search** - Tavily integration for research-aware responses
-- **Rate Limiting** - Built-in protection against abuse
-- **Responsive UI** - Modern dark theme, works on desktop & mobile
+## Architecture
 
----
-
-## 🏗️ Architecture
-
+Every message goes through a 4-step pipeline:
 ```
-Frontend (Vanilla JS) ← HTTP/REST → FastAPI Backend
-                                         ↓
-                                    Database (SQLAlchemy)
-                                         ↓
-                                    LangGraph Agent
-                                         ↓
-                                    Google Gemini API
-```
-
----
-
-## 🛠️ Tech Stack
-
-**Backend**: FastAPI, SQLAlchemy, LangGraph, Google Gemini, Tavily Search, JWT Auth, Rate Limiting  
-**Frontend**: HTML5, CSS3, Vanilla JavaScript, Mermaid.js, Font Awesome  
-**Database**: SQLite (dev) / PostgreSQL (production)  
-**Python 3.10+**
-
----
-
-## 📁 Project Structure
-
-```
-backend/app/
-├── main.py              # FastAPI routes
-├── agent.py             # LangGraph workflow
-├── auth.py              # Authentication
-├── database.py          # SQLAlchemy models
-├── tool.py              # Custom tools
-├── prompt.yaml          # LLM prompts
-├── mermaid_app.db       # SQLite database
-└── agent_logs/          # Execution logs
-
-frontend/
-├── index.html           # UI + Auth Modal
-├── script.js            # Client logic
-├── style.css            # Main styling
-└── auth.css             # Auth styling
+User message
+    │
+    ▼
+1. Regex sanitizer          — instant, blocks prompt injection patterns
+    │
+    ▼
+2. Flash-Lite safety check  — plain text, single-word verdict (safe/unsafe)
+    │
+    ▼
+3. Flash orchestrator       — routes to "workflow" or "direct"
+    │
+    ├─► workflow: Mermaid tool loop (generate → validate → fix → repeat)
+    └─► direct:   General tool loop (answer + optional web search)
+    │
+    ▼
+4. Full answer sent via SSE
 ```
 
----
+## Setup
 
-## 🚀 Quick Start
-
-### 1. Setup
+**Prerequisites:** Python 3.11+, Node (for `mmdc` Mermaid CLI)
 ```bash
-cd "AI Diagram Generator"
-python -m venv venv
-venv\Scripts\activate   # Windows
+# Install Mermaid CLI
+npm install -g @mermaid-js/mermaid-cli
+
+# Install Python deps
 cd backend
 pip install -r requirements.txt
+
+# Copy and fill in env vars
+cp .env.example .env
 ```
 
-### 2. Configure `.env` in `backend/app/`
-```env
-GOOGLE_API_KEY=your_key
-TAVILY_API_KEY=your_key
-SECRET_KEY=your_secret_key
-ACCESS_TOKEN_EXPIRE_MINUTES=1440
-DEV_MODE=true
-DATABASE_URL=sqlite+aiosqlite:///./mermaid_app.db
-``` 
+**Required `.env` values:**
+```bash
+SECRET_KEY=       # min 32 chars — generate with: openssl rand -hex 32
+DATABASE_URL=     # postgresql+asyncpg://user:pass@host/neondb
+GOOGLE_API_KEY=   # Gemini API key
+TAVILY_API_KEY=   # Tavily search API key
+RESEND_API_KEY=   # Resend email API key (password reset)
+EMAIL_FROM=       # verified sender address in Resend
+APP_URL=          # e.g. http://localhost:8000
+DEV_MODE=         # true for local dev only — never in production
+```
 
-### 3. Run
+**Run:**
 ```bash
 cd backend/app
-python main.py
+uvicorn main:app --reload
 ```
 
-Open `http://localhost:8000` → Sign up → Start creating diagrams!
+Open `http://localhost:8000`.
 
----
+## Auth Flow
 
-## 📡 API Endpoints
+- **Register / Login** → returns `access_token` (15 min) + `refresh_token` (30 days)
+- **Silent refresh** — frontend automatically exchanges refresh token on 401, no re-login needed
+- **Logout** — revokes refresh token server-side
+- **Password reset** — email link via Resend, single-use token, expires in 1 hour
 
-### Auth
-- `POST /api/auth/register` - Create account
-- `POST /api/auth/login` - Login
-- `GET /api/auth/me` - Current user
-
-### Conversations (Auth required)
-- `GET /api/conversations` - List all
-- `POST /api/conversations` - Create new
-- `DELETE /api/conversations/{id}` - Delete
-- `GET /api/conversations/{id}/messages` - Get messages
-
-### Diagram Generation
-- `POST /api/prompt` - Send message, get AI response
-- `GET /health` - Server status
-
----
-
-## 📝 Usage
-
-1. **Create Chat** → Click "+" in sidebar
-2. **Enter Prompt** → e.g., "Create a flowchart for user login"
-3. **Wait** → Model generates and validates diagram
-4. **View** → Mermaid diagram renders in chat
-5. **Export** → Copy code or download as PNG
-
----
-
-## 🔐 Security
-
-- JWT authentication on all endpoints
-- bcrypt password hashing
-- Rate limiting (20-60 req/min per endpoint)
-- SQLite for dev, PostgreSQL recommended for production
-- CORS configured for dev/production modes
-
----
-
-## 📖 Environment Variables
-
-```env
-# LLM
-GOOGLE_API_KEY=          # Required: Gemini API key
-TAVILY_API_KEY=          # Required: Web search API
-
-# Auth
-SECRET_KEY=              # Required: JWT secret (use: openssl rand -hex 32)
-ACCESS_TOKEN_EXPIRE_MINUTES=1440
-
-# Database
-DATABASE_URL=sqlite+aiosqlite:///./mermaid_app.db
-# For PostgreSQL: postgresql+asyncpg://user:pass@localhost/dbname
-
-# Server
-DEV_MODE=true            # Set false in production
-ALLOWED_ORIGINS=http://localhost:8000,http://127.0.0.1:8000
+## Project Structure
+```
+├── backend/app/
+│   ├── main.py           # FastAPI app, SSE streaming endpoint
+│   ├── agent.py          # LLM pipeline (safety → route → tool loop)
+│   ├── auth.py           # JWT, refresh tokens, password reset
+│   ├── database.py       # SQLAlchemy models
+│   ├── tool.py           # Tavily search + Mermaid CLI syntax check
+│   ├── email_service.py  # Resend integration
+│   ├── logger.py         # JSON structured logging
+│   ├── prompt.yaml       # All LLM prompts
+│   └── context.py        # Request ID context var
+└── frontend/
+    ├── index.html
+    ├── script.js         # SSE client, silent token refresh, diagram rendering
+    ├── style.css
+    └── auth.css
 ```
 
----
+## Free Tier Services
 
-## 🚢 Production Deployment
-
-1. Use PostgreSQL instead of SQLite
-2. Set `DEV_MODE=false`
-3. Configure `ALLOWED_ORIGINS` with your domain
-4. Use Gunicorn: `gunicorn -w 4 -k uvicorn.workers.UvicornWorker main:app`
-5. Run behind Nginx with HTTPS
-
----
-
-## 📄 License
-
-MIT License
+| Service | Free Tier |
+|---|---|
+| [Neon](https://neon.tech) | 0.5 GB storage, 1 project |
+| [Resend](https://resend.com) | 3,000 emails/month |
+| [Tavily](https://tavily.com) | 1,000 searches/month |
+| [Google AI Studio](https://aistudio.google.com) | Gemini API free tier |
