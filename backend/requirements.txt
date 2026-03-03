@@ -7,7 +7,7 @@ pydantic==2.12.5
 # Database
 sqlalchemy==2.0.36
 aiosqlite==0.20.0          # SQLite async driver
-# asyncpg==0.30.0           # Uncomment for Postgres
+asyncpg==0.30.0           # Uncomment for Postgres
 
 # Auth
 python-jose[cryptography]==3.3.0
@@ -27,3 +27,4 @@ langsmith==0.6.7
 
 # HTTP
 aiohttp==3.13.3
+resend==2.2.0
